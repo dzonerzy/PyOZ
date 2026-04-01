@@ -1169,6 +1169,15 @@ const Point = struct {
         return self.x * other_x + self.y * other_y;
     }
 
+    /// Translate the point by dx and dy (keyword arguments)
+    pub fn translate(self: *Point, args: pyoz.Args(struct {
+        dx: f64 = 0,
+        dy: f64 = 0,
+    })) void {
+        self.x += args.value.dx;
+        self.y += args.value.dy;
+    }
+
     /// Static method: create origin point (no self!)
     pub fn origin() Point {
         return .{ .x = 0.0, .y = 0.0 };

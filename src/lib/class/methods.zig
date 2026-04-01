@@ -14,6 +14,7 @@ const class_mod = @import("mod.zig");
 const ClassInfo = class_mod.ClassInfo;
 const source_parser = @import("../source_parser.zig");
 const errors_mod = @import("../errors.zig");
+const wrappers_mod = @import("../wrappers.zig");
 
 /// Build method wrappers for a given type
 pub fn MethodBuilder(comptime class_name: [*:0]const u8, comptime T: type, comptime PyWrapper: type, comptime class_infos: []const ClassInfo, comptime slot_dunders: []const []const u8) type {
@@ -181,6 +182,18 @@ pub fn MethodBuilder(comptime class_name: [*:0]const u8, comptime T: type, compt
             return FirstParam == type;
         }
 
+        /// Check if an instance method uses pyoz.Args(T) for keyword arguments.
+        fn isMethodNamedKwargs(comptime method_name: []const u8) bool {
+            const method = @field(T, method_name);
+            const fn_info = @typeInfo(@TypeOf(method)).@"fn";
+            if (fn_info.params.len < 2) return false;
+
+            const P = fn_info.params[1].type orelse return false;
+            if (@typeInfo(P) != .@"struct") return false;
+
+            return @hasDecl(P, "is_pyoz_args");
+        }
+
         // ====================================================================
         // Docstring helpers
         // ====================================================================
@@ -232,15 +245,23 @@ pub fn MethodBuilder(comptime class_name: [*:0]const u8, comptime T: type, compt
             // Add instance methods
             for (decls) |decl| {
                 if (isInstanceMethod(decl.name)) {
+                    const is_kwargs = isMethodNamedKwargs(decl.name);
+
                     m[idx] = .{
                         .ml_name = @ptrCast(decl.name.ptr),
-                        .ml_meth = @ptrCast(generateMethodWrapper(decl.name)),
-                        .ml_flags = py.METH_VARARGS,
+                        .ml_meth = if (is_kwargs)
+                            @ptrCast(generateMethodWrapperWithKeywords(decl.name))
+                        else
+                            @ptrCast(generateMethodWrapper(decl.name)),
+                        .ml_flags = if (is_kwargs)
+                            py.METH_VARARGS | py.METH_KEYWORDS
+                        else
+                            py.METH_VARARGS,
                         .ml_doc = stubs_mod.buildMlDoc(
                             decl.name,
                             @TypeOf(@field(T, decl.name)),
                             .instance_method,
-                            .positional,
+                            if (is_kwargs) .args_struct else .positional,
                             getMethodDoc(decl.name),
                             getMethodParams(decl.name),
                         ),
@@ -484,6 +505,94 @@ pub fn MethodBuilder(comptime class_name: [*:0]const u8, comptime T: type, compt
                             return Conv.toPy(@TypeOf(value), value);
                         } else {
                             if (py.PyErr_Occurred() != null) return null;
+                            return py.Py_RETURN_NONE();
+                        }
+                    } else if (ReturnType == void) {
+                        return py.Py_RETURN_NONE();
+                    } else {
+                        return Conv.toPy(ReturnType, result);
+                    }
+                }
+            }.wrapper;
+        }
+
+        // ====================================================================
+        // Instance method wrapper generation (keyword arguments via Args(T))
+        // ====================================================================
+
+        fn generateMethodWrapperWithKeywords(comptime method_name: []const u8) *const fn (
+            ?*py.PyObject,
+            ?*py.PyObject,
+            ?*py.PyObject,
+        ) callconv(.c) ?*py.PyObject {
+            const method = @field(T, method_name);
+            const fn_info = @typeInfo(@TypeOf(method)).@"fn";
+            const params = fn_info.params;
+            const RawReturnType = fn_info.return_type orelse void;
+            const ReturnType = unwrapSignature(RawReturnType);
+
+            const ArgsWrapperType = params[1].type.?;
+            const ArgsStructType = ArgsWrapperType.ArgsStruct;
+
+            return struct {
+                fn wrapper(
+                    self_obj: ?*py.PyObject,
+                    args: ?*py.PyObject,
+                    kwargs: ?*py.PyObject,
+                ) callconv(.c) ?*py.PyObject {
+                    const self: *PyWrapper = @ptrCast(@alignCast(self_obj orelse return null));
+
+                    const result_args = wrappers_mod.parseNamedArgs(ArgsStructType, class_infos, args, kwargs) orelse return null;
+
+                    const wrapped_args = ArgsWrapperType{ .value = result_args };
+                    const raw_result = @call(.auto, method, .{ self.getData(), wrapped_args });
+                    const result = unwrapSignatureValue(RawReturnType, raw_result);
+
+                    return handleReturn(result, self_obj.?, self.getData());
+                }
+
+                fn handleReturn(result: ReturnType, self_obj: *py.PyObject, self_data: *T) ?*py.PyObject {
+                    const rt_info = @typeInfo(ReturnType);
+                    const Conv = conversion.Converter(class_infos);
+
+                    if (rt_info == .pointer) {
+                        const ptr_info = rt_info.pointer;
+                        if (ptr_info.size == .one and ptr_info.child == T) {
+                            const result_ptr: *const T = if (ptr_info.is_const) result else result;
+                            if (result_ptr == self_data) {
+                                py.Py_IncRef(self_obj);
+                                return self_obj;
+                            }
+                        }
+                    }
+
+                    if (rt_info == .error_union) {
+                        if (result) |value| {
+                            const ValueType = @TypeOf(value);
+                            const val_info = @typeInfo(ValueType);
+                            if (val_info == .pointer and val_info.pointer.size == .one and val_info.pointer.child == T) {
+                                const result_ptr: *const T = if (val_info.pointer.is_const) value else value;
+                                if (result_ptr == self_data) {
+                                    py.Py_IncRef(self_obj);
+                                    return self_obj;
+                                }
+                            }
+
+                            return Conv.toPy(ValueType, value);
+                        } else |err| {
+                            if (py.PyErr_Occurred() == null) {
+                                const msg = @errorName(err);
+                                py.PyErr_SetString(errors_mod.mapWellKnownError(msg), msg.ptr);
+                            }
+
+                            return null;
+                        }
+                    } else if (rt_info == .optional) {
+                        if (result) |value| {
+                            return Conv.toPy(@TypeOf(value), value);
+                        } else {
+                            if (py.PyErr_Occurred() != null) return null;
+
                             return py.Py_RETURN_NONE();
                         }
                     } else if (ReturnType == void) {

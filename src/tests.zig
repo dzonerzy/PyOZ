@@ -804,6 +804,40 @@ test "Point - docstrings" {
     try std.testing.expect(try python.eval(bool, "'2D point' in example.Point.__doc__"));
 }
 
+test "Point - translate with keyword arguments" {
+    const python = try initTestPython();
+
+    // Both keyword args
+    try python.exec("p = example.Point(1.0, 2.0)");
+    try python.exec("p.translate(dx=3.0, dy=4.0)");
+    try std.testing.expectApproxEqAbs(@as(f64, 4.0), try python.eval(f64, "p.x"), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 6.0), try python.eval(f64, "p.y"), 0.0001);
+
+    // Positional args
+    try python.exec("p2 = example.Point(0.0, 0.0)");
+    try python.exec("p2.translate(1.0, 2.0)");
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), try python.eval(f64, "p2.x"), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), try python.eval(f64, "p2.y"), 0.0001);
+
+    // Partial keyword (dx only, dy defaults to 0)
+    try python.exec("p3 = example.Point(5.0, 5.0)");
+    try python.exec("p3.translate(dx=10.0)");
+    try std.testing.expectApproxEqAbs(@as(f64, 15.0), try python.eval(f64, "p3.x"), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 5.0), try python.eval(f64, "p3.y"), 0.0001);
+
+    // No args (both default to 0)
+    try python.exec("p4 = example.Point(1.0, 1.0)");
+    try python.exec("p4.translate()");
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), try python.eval(f64, "p4.x"), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), try python.eval(f64, "p4.y"), 0.0001);
+
+    // Mixed positional + keyword
+    try python.exec("p5 = example.Point(0.0, 0.0)");
+    try python.exec("p5.translate(5.0, dy=3.0)");
+    try std.testing.expectApproxEqAbs(@as(f64, 5.0), try python.eval(f64, "p5.x"), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.0), try python.eval(f64, "p5.y"), 0.0001);
+}
+
 // ============================================================================
 // CLASS: Number (arithmetic operations)
 // ============================================================================
@@ -1923,6 +1957,60 @@ test "fn calculate_named - keyword arguments with operations" {
 
     // Divide
     try std.testing.expectApproxEqAbs(@as(f64, 2.5), try python.eval(f64, "example.calculate_named(x=10, y=4, operation='div')"), 0.0001);
+}
+
+test "fn greet_named - fromPy exception not overwritten" {
+    const python = try initTestPython();
+
+    try python.exec(
+        \\try:
+        \\    example.greet_named(name='hi', times=2**63)
+        \\    exc_type = None
+        \\except OverflowError:
+        \\    exc_type = 'OverflowError'
+        \\except TypeError:
+        \\    exc_type = 'TypeError'
+    );
+    try std.testing.expect(try python.eval(bool, "exc_type == 'OverflowError'"));
+}
+
+test "fn greet_named - unexpected kwargs rejected" {
+    const python = try initTestPython();
+
+    try python.exec(
+        \\try:
+        \\    example.greet_named(name='hi', foo=1)
+        \\    raised = False
+        \\except TypeError:
+        \\    raised = True
+    );
+    try std.testing.expect(try python.eval(bool, "raised"));
+}
+
+test "fn greet_named - too many positional args rejected" {
+    const python = try initTestPython();
+
+    try python.exec(
+        \\try:
+        \\    example.greet_named('hi', 'Hey', 1, True, 'extra')
+        \\    raised = False
+        \\except TypeError:
+        \\    raised = True
+    );
+    try std.testing.expect(try python.eval(bool, "raised"));
+}
+
+test "fn greet_named - duplicate positional and keyword rejected" {
+    const python = try initTestPython();
+
+    try python.exec(
+        \\try:
+        \\    example.greet_named('hi', name='hello')
+        \\    raised = False
+        \\except TypeError:
+        \\    raised = True
+    );
+    try std.testing.expect(try python.eval(bool, "raised"));
 }
 
 // ============================================================================

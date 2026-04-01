@@ -125,8 +125,122 @@ pub fn ArgsTuple(comptime params: anytype) type {
 /// Type for keyword function signature (C calling convention)
 pub const PyCFunctionWithKeywords = *const fn (?*PyObject, ?*PyObject, ?*PyObject) callconv(.c) ?*PyObject;
 
-/// Generate a Python-callable wrapper for a Zig function with named keyword arguments
-/// The function should take Args(SomeStruct) as its parameter
+/// Parse positional and keyword arguments into an Args struct.
+/// Sets the appropriate Python exception and returns null on failure.
+pub fn parseNamedArgs(
+    comptime ArgsStructType: type,
+    comptime class_infos: []const ClassInfo,
+    args: ?*py.PyObject,
+    kwargs: ?*py.PyObject,
+) ?ArgsStructType {
+    const Conv = Converter(class_infos);
+    const args_fields = @typeInfo(ArgsStructType).@"struct".fields;
+    var result: ArgsStructType = undefined;
+
+    // Get positional args count
+    const pos_count: usize = if (args) |a| @intCast(py.PyTuple_Size(a)) else 0;
+
+    if (pos_count > args_fields.len) {
+        py.PyErr_SetString(
+            py.PyExc_TypeError(),
+            "Too many positional arguments (expected at most " ++
+                std.fmt.comptimePrint("{}", .{args_fields.len}) ++ ")",
+        );
+        return null;
+    }
+
+    // Track how many kwargs were consumed to detect unexpected kwargs.
+    var kwargs_consumed: usize = 0;
+
+    // Parse each field
+    inline for (args_fields, 0..) |field, i| {
+        const has_default = field.default_value_ptr != null;
+        const is_optional = @typeInfo(field.type) == .optional;
+
+        // Try positional first
+        if (i < pos_count) {
+            const item = py.PyTuple_GetItem(args.?, @intCast(i)) orelse {
+                py.PyErr_SetString(py.PyExc_TypeError(), "Invalid argument at position " ++ std.fmt.comptimePrint("{}", .{i}));
+                return null;
+            };
+            if (is_optional and py.PyNone_Check(item)) {
+                @field(result, field.name) = null;
+            } else if (is_optional) {
+                @field(result, field.name) = Conv.fromPy(@typeInfo(field.type).optional.child, item) catch {
+                    if (py.PyErr_Occurred() == null)
+                        py.PyErr_SetString(py.PyExc_TypeError(), "Invalid type for argument: " ++ field.name);
+                    return null;
+                };
+            } else {
+                @field(result, field.name) = Conv.fromPy(field.type, item) catch {
+                    if (py.PyErr_Occurred() == null)
+                        py.PyErr_SetString(py.PyExc_TypeError(), "Invalid type for argument: " ++ field.name);
+                    return null;
+                };
+            }
+        } else if (kwargs) |kw| {
+            // Try keyword argument by name
+            if (py.PyDict_GetItemString(kw, field.name.ptr)) |item| {
+                kwargs_consumed += 1;
+                if (is_optional and py.PyNone_Check(item)) {
+                    @field(result, field.name) = null;
+                } else if (is_optional) {
+                    @field(result, field.name) = Conv.fromPy(@typeInfo(field.type).optional.child, item) catch {
+                        if (py.PyErr_Occurred() == null)
+                            py.PyErr_SetString(py.PyExc_TypeError(), "Invalid type for argument: " ++ field.name);
+                        return null;
+                    };
+                } else {
+                    @field(result, field.name) = Conv.fromPy(field.type, item) catch {
+                        if (py.PyErr_Occurred() == null)
+                            py.PyErr_SetString(py.PyExc_TypeError(), "Invalid type for argument: " ++ field.name);
+                        return null;
+                    };
+                }
+            } else if (has_default) {
+                // Use default value
+                @field(result, field.name) = field.defaultValue().?;
+            } else if (is_optional) {
+                @field(result, field.name) = null;
+            } else {
+                py.PyErr_SetString(py.PyExc_TypeError(), "Missing required argument: " ++ field.name);
+                return null;
+            }
+        } else if (has_default) {
+            // Use default value
+            @field(result, field.name) = field.defaultValue().?;
+        } else if (is_optional) {
+            @field(result, field.name) = null;
+        } else {
+            py.PyErr_SetString(py.PyExc_TypeError(), "Missing required argument: " ++ field.name);
+            return null;
+        }
+    }
+
+    if (kwargs) |kw| {
+        // Check for unexpected keyword arguments.
+        const kwargs_total: usize = @intCast(py.PyDict_Size(kw));
+        if (kwargs_consumed < kwargs_total) {
+            // Distinguish between duplicate positional+keyword and truly unexpected kwargs.
+            inline for (args_fields, 0..) |field, i| {
+                if (i < pos_count and py.PyDict_GetItemString(kw, field.name.ptr) != null) {
+                    py.PyErr_SetString(
+                        py.PyExc_TypeError(),
+                        "Got multiple values for argument '" ++ field.name ++ "'",
+                    );
+                    return null;
+                }
+            }
+            py.PyErr_SetString(py.PyExc_TypeError(), "Unexpected keyword argument");
+            return null;
+        }
+    }
+
+    return result;
+}
+
+/// Generate a Python-callable wrapper for a Zig function with named keyword arguments.
+/// The function should take Args(SomeStruct) as its parameter.
 pub fn wrapFunctionWithNamedKeywords(comptime zig_func: anytype, comptime class_infos: []const ClassInfo) PyCFunctionWithKeywords {
     const Conv = Converter(class_infos);
     const Fn = @TypeOf(zig_func);
@@ -141,78 +255,12 @@ pub fn wrapFunctionWithNamedKeywords(comptime zig_func: anytype, comptime class_
     else
         @compileError("kwfunc parameter must be wrapped in pyoz.Args(T). Change `fn(" ++
             @typeName(ArgsWrapperType) ++ ")` to `fn(pyoz.Args(YourArgsStruct))`");
-    const args_fields = @typeInfo(ArgsStructType).@"struct".fields;
 
     return struct {
         fn wrapper(self: ?*PyObject, args: ?*PyObject, kwargs: ?*PyObject) callconv(.c) ?*PyObject {
             _ = self;
 
-            var result_args: ArgsStructType = undefined;
-
-            // Get positional args count
-            const pos_count: usize = if (args) |a| @intCast(py.PyTuple_Size(a)) else 0;
-
-            // Parse each field
-            inline for (args_fields, 0..) |field, i| {
-                const has_default = field.default_value_ptr != null;
-                const is_optional = @typeInfo(field.type) == .optional;
-
-                // Try positional first
-                if (i < pos_count) {
-                    const item = py.PyTuple_GetItem(args.?, @intCast(i)) orelse {
-                        setError(error.InvalidArgument);
-                        return null;
-                    };
-                    if (is_optional and py.PyNone_Check(item)) {
-                        @field(result_args, field.name) = null;
-                    } else if (is_optional) {
-                        const inner_type = @typeInfo(field.type).optional.child;
-                        @field(result_args, field.name) = Conv.fromPy(inner_type, item) catch {
-                            setFieldError(field.name);
-                            return null;
-                        };
-                    } else {
-                        @field(result_args, field.name) = Conv.fromPy(field.type, item) catch {
-                            setFieldError(field.name);
-                            return null;
-                        };
-                    }
-                } else if (kwargs) |kw| {
-                    // Try keyword argument by name
-                    if (py.PyDict_GetItemString(kw, field.name.ptr)) |item| {
-                        if (is_optional and py.PyNone_Check(item)) {
-                            @field(result_args, field.name) = null;
-                        } else if (is_optional) {
-                            const inner_type = @typeInfo(field.type).optional.child;
-                            @field(result_args, field.name) = Conv.fromPy(inner_type, item) catch {
-                                setFieldError(field.name);
-                                return null;
-                            };
-                        } else {
-                            @field(result_args, field.name) = Conv.fromPy(field.type, item) catch {
-                                setFieldError(field.name);
-                                return null;
-                            };
-                        }
-                    } else if (has_default) {
-                        // Use default value
-                        @field(result_args, field.name) = field.defaultValue().?;
-                    } else if (is_optional) {
-                        @field(result_args, field.name) = null;
-                    } else {
-                        setMissingError(field.name);
-                        return null;
-                    }
-                } else if (has_default) {
-                    // Use default value
-                    @field(result_args, field.name) = field.defaultValue().?;
-                } else if (is_optional) {
-                    @field(result_args, field.name) = null;
-                } else {
-                    setMissingError(field.name);
-                    return null;
-                }
-            }
+            const result_args = parseNamedArgs(ArgsStructType, class_infos, args, kwargs) orelse return null;
 
             // Call function with wrapped args
             const wrapped_args = ArgsWrapperType{ .value = result_args };
@@ -228,28 +276,18 @@ pub fn wrapFunctionWithNamedKeywords(comptime zig_func: anytype, comptime class_
                 if (result) |value| {
                     return Conv.toPy(@TypeOf(value), value);
                 } else |err| {
-                    setError(err);
+                    // Don't overwrite an exception already set by Python, e.g.
+                    // KeyboardInterrupt from checkSignals.
+                    if (py.PyErr_Occurred() == null) {
+                        const msg = @errorName(err);
+                        py.PyErr_SetString(mapErrorToExc(err), msg.ptr);
+                    }
+
                     return null;
                 }
             } else {
                 return Conv.toPy(RT, result);
             }
-        }
-
-        fn setError(err: anyerror) void {
-            // Don't overwrite an exception already set by Python
-            // (e.g., KeyboardInterrupt from checkSignals)
-            if (py.PyErr_Occurred() != null) return;
-            const msg = @errorName(err);
-            py.PyErr_SetString(mapErrorToExc(err), msg.ptr);
-        }
-
-        fn setFieldError(comptime field_name: []const u8) void {
-            py.PyErr_SetString(py.PyExc_TypeError(), "Invalid type for argument: " ++ field_name);
-        }
-
-        fn setMissingError(comptime field_name: []const u8) void {
-            py.PyErr_SetString(py.PyExc_TypeError(), "Missing required argument: " ++ field_name);
         }
     }.wrapper;
 }

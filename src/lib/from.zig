@@ -476,15 +476,19 @@ pub fn isStringConstType(comptime T: type) bool {
 // Calling Convention Detection
 // =============================================================================
 
-/// Check if a function takes pyoz.Args(T) as its first (and only) parameter.
+/// Check if a function takes pyoz.Args(T) as its last parameter.
 /// This means it uses named keyword arguments.
+/// Works for both module functions `fn(Args(T))` and methods `fn(*Self, Args(T))`.
 pub fn isNamedKwargsFunc(comptime Fn: type) bool {
     const info = @typeInfo(Fn);
     if (info != .@"fn") return false;
+
     const params = info.@"fn".params;
-    if (params.len != 1) return false;
-    const ParamType = params[0].type orelse return false;
+    if (params.len == 0) return false;
+
+    const ParamType = params[params.len - 1].type orelse return false;
     if (@typeInfo(ParamType) != .@"struct") return false;
+
     return @hasDecl(ParamType, "is_pyoz_args");
 }
 

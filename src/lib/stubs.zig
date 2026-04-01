@@ -383,8 +383,13 @@ pub fn buildMlDoc(
                     need_comma = true;
                 }
 
-                if (params.len >= 1) {
-                    const ArgsWrapperType = params[0].type.?;
+                // Args param is last: index 0 for module funcs, 1 for methods
+                const args_param_idx: usize = switch (kind) {
+                    .instance_method, .class_method => 1,
+                    .module_func, .static_method => 0,
+                };
+                if (params.len > args_param_idx) {
+                    const ArgsWrapperType = params[args_param_idx].type.?;
                     if (@typeInfo(ArgsWrapperType) == .@"struct" and @hasDecl(ArgsWrapperType, "ArgsStruct")) {
                         const ArgsStructType = ArgsWrapperType.ArgsStruct;
                         const args_fields = @typeInfo(ArgsStructType).@"struct".fields;

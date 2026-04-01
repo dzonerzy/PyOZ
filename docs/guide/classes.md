@@ -33,7 +33,7 @@ const MyClass = struct {
     // Public fields - exposed to Python
     name: []const u8,
     value: i64,
-    
+
     // Private fields - NOT exposed to Python
     _internal_counter: i64,
     _cache: ?SomeType,
@@ -58,7 +58,7 @@ This is useful for:
 const Counter = struct {
     count: i64,           // Public: users can read/write this
     _step: i64,           // Private: internal implementation detail
-    
+
     pub fn increment(self: *Counter) void {
         self.count += self._step;  // Methods can access private fields
     }
@@ -112,6 +112,30 @@ PyOZ auto-detects method types based on the first parameter:
 | Anything else | Static method | `Class.method()` |
 
 Use `*const Self` for methods that don't modify the instance.
+
+### Keyword Arguments on Methods
+
+Methods can use `pyoz.Args(T)` for keyword arguments, just like module-level functions:
+
+```zig
+const Point = struct {
+    x: f64,
+    y: f64,
+
+    pub fn translate(self: *Point, args: pyoz.Args(struct {
+        dx: f64 = 0,
+        dy: f64 = 0,
+    })) void {
+        self.x += args.value.dx;
+        self.y += args.value.dy;
+    }
+};
+```
+
+Python: `p.translate(dx=3.0)`, `p.translate(1.0, 2.0)`, or `p.translate()`
+
+Struct fields with defaults become optional keyword arguments,
+same as [module-level keyword functions](functions.md#keyword-arguments-pyozkwfunc).
 
 ## Docstrings
 
